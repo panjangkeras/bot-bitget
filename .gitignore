@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment — JANGAN pernah commit ini!
+.env
+
+# Trade history local backup
+data/trades.json
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
