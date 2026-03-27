@@ -1,6 +1,6 @@
 /**
  * ══════════════════════════════════════════════════════════
- *  BITGET SCALPING SANTAI — index.js  v2.1
+ *  BITGET SCALPING SANTAI — index.js  v2.4
  *
  *  Fixes v2.1:
  *  - Session logic diperbaiki: entry HANYA 23.00–19.00 WIB
@@ -8,6 +8,25 @@
  *  - Candle 1m naik ke 200 (warmup StochRSI cukup)
  *  - SL/TP berbasis ATR (tidak lagi flat %)
  *  - Partial close & managePosition pakai size aktual dari exchange
+ *
+ *  Fixes v2.3:
+ *  - Bug fix: closeReason undefined di handlePositionClosed()
+ *  - Aktifkan getSlTpAtr() untuk SL/TP yang lebih adaptif
+ *  - Fix estPnl di handlePositionClosed pakai size aktual (bukan usdtPerTrade)
+ *  - Fix indentasi dailyStats/dailyLoss update (konsisten)
+ *  - managePosition re-init juga pakai getSlTpAtr()
+ *
+ *  Fixes v2.4:
+ *  - BUG 1 FIX: closeReason pakai lastEvalResult[] bukan posMgr.get()
+ *    yang sudah di-remove → TIME LIMIT/TRAILING SL kini terbaca benar
+ *  - BUG 2 FIX: Exit price ambil dari /history filled orders dulu,
+ *    baru fallback ke plan order triggerPrice, terakhir current price
+ *    → PnL estimation jauh lebih akurat
+ *  - ISSUE 3 FIX: Hapus XAGUSDT dari default SYMBOLS (silver beda karakteristik)
+ *  - ISSUE 4 FIX: preferLong/preferShort di sessionBias kini jadi filter
+ *    nyata — SHORT diblokir saat Asia Night/Morning (23–09 WIB)
+ *  - Interval default naik 45s → 60s untuk kurangi over-trading
+ *  - lastEvalResult dibersihkan di semua path close (CLOSE_ALL, RSI, handled)
  * ══════════════════════════════════════════════════════════
  */
 
@@ -21,8 +40,8 @@ const { Notifier }          = require("./src/utils/notifier");
 const { FundingRateFilter } = require("./src/core/fundingRate");
 const { PnlTracker }        = require("./src/core/pnlTracker");
 const logger                = require("./src/utils/logger");
-const { getSlTp }           = require("./src/core/slTpTable");
-
+const { getSlTp, getSlTpAtr } = require("./src/core/slTpTable");
+const { calcDynamicSize, updateStreak } = require("./src/core/dynamicSizing");
 // ─── SYMBOL INFO ─────────────────────────────────────────
 const SYMBOL_INFO = {};
 
@@ -101,7 +120,7 @@ const CONFIG = {
 
   minConfidence: parseFloat(process.env.MIN_CONFIDENCE) || 0.67, // was 0.65
 
-  intervalMs  : 45_000,
+  intervalMs  : 60_000,  // 60s — lebih aman untuk 1 symbol, kurangi over-trading
 
   // ── FIX: 200 candle untuk 1m supaya StochRSI punya cukup warmup ──
   candleLimit : 200,
@@ -112,7 +131,11 @@ let dailyLoss    = 0;
 let lastResetDay = new Date().toDateString();
 let tickCount    = 0;
 let botRunning   = true;
-let dailyStats   = { wins: 0, losses: 0, trades: 0, totalPnl: 0 };
+let dailyStats = {
+  wins: 0, losses: 0, trades: 0, totalPnl: 0,
+  recentLossStreak: 0,   // ← TAMBAH
+  recentWinStreak : 0,   // ← TAMBAH
+};
 const sentimentCache  = {};
 const lastNewsTimeMap = {};
 const posMgr          = new PositionManager();
@@ -121,6 +144,9 @@ const orderingSymbols = new Set();
 let   frFilter        = null;
 const activePositions = {};
 let   _notifier       = null;
+// FIX BUG 1: Simpan hasil evaluate() terakhir tiap symbol
+// supaya handlePositionClosed() tahu alasan posisi ditutup
+const lastEvalResult  = {};
 
 // ─── MAIN ────────────────────────────────────────────────
 async function main() {
@@ -155,13 +181,13 @@ async function main() {
   await loadSymbolInfo(client);
   frFilter = new FundingRateFilter(client);
 
-  logger.success(`🤖 Bitget Scalping Santai v2.1`);
+  logger.success(`🤖 Bitget Scalping Santai v2.4`);
   logger.success(`📊 Pairs : ${CONFIG.symbols.join(", ")}`);
   logger.success(`⚡ Max Lev: ${CONFIG.leverage}x (AI pilih 10–${CONFIG.leverage}x)`);
   logger.success(`💵 Entry : $${CONFIG.usdtPerTrade}/trade | Max Loss: $${CONFIG.maxDailyLoss}/hari`);
   logger.success(`📈 MTF   : 1m entry | 5m konfirmasi | 15m+30m trend`);
   logger.success(`🧠 AI    : Cerebras llama3.1-8b | MinConf: ${CONFIG.minConfidence}`);
-  logger.success(`⏰ Sesi  : Entry HANYA 23.00–19.00 WIB | Skip 19.01–22.59 WIB`);
+  logger.success(`⏰ Sesi  : Entry 23.00–19.00 WIB | Skip 19.01–22.59 WIB | SHORT skip 23–09 WIB`);
 
   for (const symbol of CONFIG.symbols) {
     for (const side of ["long", "short"]) {
@@ -178,11 +204,11 @@ async function main() {
 
   const allTime = pnlTracker.allTimeStats();
   await notifier.send(
-    `🤖 *Scalping Santai v2.1 — Started*\n` +
+    `🤖 *Scalping Santai v2.4 — Started*\n` +
     `📊 Pairs: ${CONFIG.symbols.map(s => s.replace("USDT","")).join(" | ")}\n` +
     `⚡ Max Lev: ${CONFIG.leverage}x | Entry: $${CONFIG.usdtPerTrade}\n` +
     `🛡 Max Loss/hari: $${CONFIG.maxDailyLoss} | MaxPos: ${CONFIG.maxOpenPos}\n` +
-    `⏰ Session: Entry 23.00–19.00 WIB | SL berbasis ATR\n` +
+    `⏰ Session: Entry 23.00–19.00 WIB | SHORT skip 23–09 WIB | SL ATR-based\n` +
     (allTime.total > 0
       ? `📊 All-time: ${allTime.total} trades | WR:${allTime.winRate}% | PnL:$${allTime.pnl}`
       : `🆕 Fresh start — belum ada riwayat trade`)
@@ -198,7 +224,11 @@ async function main() {
       logger.info(`🌅 Hari baru — reset daily loss & stats`);
       try { await notifier.send(pnlTracker.summaryMessage()); } catch {}
       dailyLoss    = 0;
-      dailyStats   = { wins: 0, losses: 0, trades: 0, totalPnl: 0 };
+      dailyStats = {
+  wins: 0, losses: 0, trades: 0, totalPnl: 0,
+  recentLossStreak: 0,   // ← TAMBAH
+  recentWinStreak : 0,   // ← TAMBAH
+};
       lastResetDay = today;
     }
 
@@ -439,11 +469,12 @@ async function processSymbol(symbol, client, ta, groq, news, notifier, openCount
       const d      = info.decimals;
       const side   = isLong ? "buy" : "sell";
 
-      // ── FIX: SL/TP berbasis ATR ────────────────────────
-      const atrPct = atr ? (atr / price) * 100 : 0.5;
-      const slPct  = mrSignal.slPct  || Math.max(atrPct * 1.5, 0.5);
-      const tp1Pct = mrSignal.tp1Pct || Math.max(slPct * 1.5, atrPct * 2.0);
-      const tp2Pct = mrSignal.tp2Pct || Math.max(slPct * 2.5, atrPct * 3.5);
+      // ── SL/TP via getSlTpAtr — adaptif terhadap volatilitas aktual ──
+      const atrPct  = atr ? (atr / price) * 100 : 0.5;
+      const sltMR   = getSlTpAtr(useLev, "normal", atr, price);
+      const slPct   = Math.max(mrSignal.slPct  || 0, sltMR.sl);
+      const tp1Pct  = Math.max(mrSignal.tp1Pct || 0, sltMR.tp1);
+      const tp2Pct  = Math.max(mrSignal.tp2Pct || 0, sltMR.tp2);
 
       const sl  = isLong
         ? parseFloat((price * (1 - slPct  / 100)).toFixed(d))
@@ -452,9 +483,17 @@ async function processSymbol(symbol, client, ta, groq, news, notifier, openCount
         ? parseFloat((price * (1 + tp2Pct / 100)).toFixed(d))
         : parseFloat((price * (1 - tp2Pct / 100)).toFixed(d));
 
-      const size = calcSize(CONFIG.usdtPerTrade, price, useLev, info.minSize, info.sizeDecimals);
-      logger.info(`[${coin}] 🔄 MR ${mrSignal.direction} ${useLev}x | $${CONFIG.usdtPerTrade} | ATR:${atrPct.toFixed(3)}% SL:${slPct.toFixed(2)}% TP:${tp2Pct.toFixed(2)}%`);
-
+      const usdtMR = calcDynamicSize({
+  base        : CONFIG.usdtPerTrade,
+  dailyStats,
+  dailyLoss,
+  maxDailyLoss: CONFIG.maxDailyLoss,
+  confidence  : mrSignal.confidence,
+  atrPct,
+  verbose     : true,
+});
+const size = calcSize(usdtMR, price, useLev, info.minSize, info.sizeDecimals);
+logger.info(`[${coin}] 🔄 MR ${mrSignal.direction} ${useLev}x | $${usdtMR} (dyn) | ATR:${atrPct.toFixed(3)}% SL:${slPct.toFixed(2)}% TP:${tp2Pct.toFixed(2)}%`);
       orderingSymbols.add(symbol);
       await setLeverage(client, symbol, useLev);
 
@@ -580,6 +619,13 @@ async function processSymbol(symbol, client, ta, groq, news, notifier, openCount
     return;
   }
 
+  // ── FIX ISSUE 4: Terapkan session bias sebagai filter nyata ──
+  // Asia Night / Asia Morning (23-09 WIB): preferShort = false → skip SHORT
+  if (decision.action === "SELL" && !sessionBias.preferShort) {
+    logger.info(`[${coin}] ❌ TF skip — jam ${sessionBias.session} tidak prefer SHORT`);
+    return;
+  }
+
   if (orderingSymbols.has(symbol)) return;
 
   const tfDir = decision.action === "BUY" ? "LONG" : "SHORT";
@@ -608,22 +654,16 @@ async function processSymbol(symbol, client, ta, groq, news, notifier, openCount
 
   const d = info.decimals;
 
-  // ── FIX: SL/TP berbasis ATR ──────────────────────────
-  const atrPct   = atr ? (atr / price) * 100 : 0.5;
-  const sigStr   = (techAnalysis.signal === "STRONG_BUY" || techAnalysis.signal === "STRONG_SELL") ? "strong"
-                 : (decision.grade === "A" || decision.grade === "B") ? "normal" : "weak";
-  const slt      = getSlTp(useLev, sigStr);
+  // ── SL/TP via getSlTpAtr — adaptif terhadap volatilitas aktual ──
+  const atrPct = atr ? (atr / price) * 100 : 0.5;
+  const sigStr = (techAnalysis.signal === "STRONG_BUY" || techAnalysis.signal === "STRONG_SELL") ? "strong"
+               : (decision.grade === "A" || decision.grade === "B") ? "normal" : "weak";
+  const slt    = getSlTpAtr(useLev, sigStr, atr, price);
 
-  // Gunakan AI suggestion jika reasonable, jika tidak fallback ke ATR-scaled
-  const rawSlPct  = decision.slPct  || slt.sl;
-  const rawTp1Pct = decision.tp1Pct || slt.tp1;
-  const rawTp2Pct = decision.tp2Pct || slt.tp2;
-
-  // ATR floor: SL minimal 1.5x ATR (was 1.2x — terlalu tight, sering kena noise)
-  // TP2 minimal 2.5x ATR (was 3.0x — tetap pertahankan target realistis)
-  const slPct  = Math.max(rawSlPct,  atrPct * 1.5);
-  const tp1Pct = Math.max(rawTp1Pct, atrPct * 2.0);
-  const tp2Pct = Math.max(rawTp2Pct, atrPct * 3.5);
+  // AI suggestion override jika ada dan lebih konservatif dari ATR-based
+  const slPct  = Math.max(decision.slPct  || 0, slt.sl);
+  const tp1Pct = Math.max(decision.tp1Pct || 0, slt.tp1);
+  const tp2Pct = Math.max(decision.tp2Pct || 0, slt.tp2);
 
   const sl  = decision.action === "BUY"
     ? parseFloat((price * (1 - slPct  / 100)).toFixed(d))
@@ -632,10 +672,19 @@ async function processSymbol(symbol, client, ta, groq, news, notifier, openCount
     ? parseFloat((price * (1 + tp2Pct / 100)).toFixed(d))
     : parseFloat((price * (1 - tp2Pct / 100)).toFixed(d));
 
-  const size = calcSize(CONFIG.usdtPerTrade, price, useLev, info.minSize, info.sizeDecimals);
-  const side = decision.action === "BUY" ? "buy" : "sell";
+  const usdtTF = calcDynamicSize({
+  base        : CONFIG.usdtPerTrade,
+  dailyStats,
+  dailyLoss,
+  maxDailyLoss: CONFIG.maxDailyLoss,
+  confidence  : decision.confidence,
+  atrPct,
+  verbose     : true,
+});
+const size = calcSize(usdtTF, price, useLev, info.minSize, info.sizeDecimals);
+const side = decision.action === "BUY" ? "buy" : "sell";
 
-  logger.info(`[${coin}] ✅ TF ${decision.action} [${decision.grade}] ${useLev}x | $${CONFIG.usdtPerTrade} | ATR:${atrPct.toFixed(3)}% SL:${slPct.toFixed(2)}% TP1:${tp1Pct.toFixed(2)}% TP2:${tp2Pct.toFixed(2)}%`);
+  logger.info(`[${coin}] ✅ TF ${decision.action} [${decision.grade}] ${useLev}x | $${usdtTF} (dyn) | ATR:${atrPct.toFixed(3)}% SL:${slPct.toFixed(2)}% TP1:${tp1Pct.toFixed(2)}% TP2:${tp2Pct.toFixed(2)}%`);
 
   orderingSymbols.add(symbol);
   await setLeverage(client, symbol, useLev);
@@ -693,7 +742,7 @@ async function getActualEntryPrice(client, symbol, estimatedPrice) {
 }
 
 // ─── HANDLE POSISI YANG SUDAH CLOSED DI EXCHANGE ─────────
-// FIX: Coba ambil closed trade history untuk actual PnL
+// FIX BUG 1 + BUG 2: closeReason pakai lastEvalResult, PnL pakai actual fill dari history
 async function handlePositionClosed(symbol, price, info, client, notifier) {
   const closedPos = posMgr.get(symbol);
   if (!closedPos) { delete activePositions[symbol]; return; }
@@ -703,37 +752,77 @@ async function handlePositionClosed(symbol, price, info, client, notifier) {
   const entry   = closedPos.entryPrice || price;
   const usedLev = closedPos.leverage || CONFIG.leverage;
 
-  // ── FIX: Coba ambil actual PnL dari closed position history ──
-  let actualExitPrice = price;
-  let actualPnl       = null;
+  // ── FIX BUG 2: Ambil actual fill price dari history filled orders ──
+  // Pakai /history (filled orders), bukan /history-plan-order (plan orders)
+  // startTime = waktu posisi dibuka supaya tidak ambil trade lain
+  let actualExitPrice = null;
   let closeSource     = "estimated";
 
   try {
-    const history = await client._request("GET", "/api/v2/mix/order/history-plan-order", {
+    const openedAt = posMgr.getOpenedAt(symbol) || closedPos.openedAt || (Date.now() - 5 * 60 * 1000);
+    const history  = await client._request("GET", "/api/v2/mix/order/history", {
       symbol,
       productType: process.env.PRODUCT_TYPE || "USDT-FUTURES",
-      pageSize   : "5",
+      startTime  : openedAt.toString(),
+      endTime    : Date.now().toString(),
+      pageSize   : "10",
     });
-    const orders = history?.entrustedList || [];
-    // Cari order SL/TP yang paling baru sudah triggered
-    const lastClosed = orders.find(o =>
-      (o.planType === "loss_plan" || o.planType === "profit_plan") &&
-      o.state === "triggered"
-    );
-    if (lastClosed && parseFloat(lastClosed.triggerPrice) > 0) {
-      actualExitPrice = parseFloat(lastClosed.triggerPrice);
+    const orders = history?.orderList || history?.entrustedList || [];
+    // Cari close order (tradeSide = close) yang sudah filled, paling baru
+    const fillOrder = orders
+      .filter(o => o.tradeSide === "close" && o.state === "filled" && parseFloat(o.priceAvg || o.price) > 0)
+      .sort((a, b) => parseInt(b.cTime || b.uTime || 0) - parseInt(a.cTime || a.uTime || 0))[0];
+
+    if (fillOrder) {
+      actualExitPrice = parseFloat(fillOrder.priceAvg || fillOrder.price);
       closeSource     = "exchange";
     }
   } catch(e) {
-    // Fallback ke current price jika history tidak tersedia
+    logger.warn(`[${coin}] Fetch fill history gagal: ${e.message.slice(0, 80)}`);
   }
 
-  // Hitung PnL dari actual exit price
-  const diffPct = ((actualExitPrice - entry) / entry * 100 * (wasLong ? 1 : -1));
-  const estPnl  = (diffPct / 100) * CONFIG.usdtPerTrade * usedLev;
-  const hitTP   = diffPct > 0;
-  const emoji   = hitTP ? "✅" : "❌";
-  const closeType = hitTP ? "TP HIT" : "SL HIT";
+  // Fallback 1: coba triggerPrice dari plan order
+  if (!actualExitPrice) {
+    try {
+      const planHist = await client._request("GET", "/api/v2/mix/order/history-plan-order", {
+        symbol,
+        productType: process.env.PRODUCT_TYPE || "USDT-FUTURES",
+        pageSize   : "5",
+      });
+      const orders     = planHist?.entrustedList || [];
+      const lastClosed = orders.find(o =>
+        (o.planType === "loss_plan" || o.planType === "profit_plan") &&
+        o.state === "triggered" && parseFloat(o.triggerPrice) > 0
+      );
+      if (lastClosed) {
+        actualExitPrice = parseFloat(lastClosed.triggerPrice);
+        closeSource     = "exchange (plan)";
+      }
+    } catch(e) {}
+  }
+
+  // Fallback 2: current market price (least accurate)
+  if (!actualExitPrice) {
+    actualExitPrice = price;
+    closeSource     = "estimated";
+    logger.warn(`[${coin}] ⚠️ Exit price fallback ke current price $${price} — PnL mungkin tidak akurat`);
+  }
+
+  // Hitung PnL dari actual exit price — pakai size aktual bukan CONFIG.usdtPerTrade
+  const actualSize = closedPos.size || 0;
+  const diffPct    = ((actualExitPrice - entry) / entry * 100 * (wasLong ? 1 : -1));
+  const notional   = actualSize * entry;
+  const estPnl     = (diffPct / 100) * notional;
+  const hitTP      = diffPct > 0;
+  const emoji      = hitTP ? "✅" : "❌";
+
+  // ── FIX BUG 1: closeType dari lastEvalResult[symbol], bukan posMgr.get() ──
+  // lastEvalResult menyimpan hasil evaluate() terakhir sebelum posisi hilang
+  const lastEval  = lastEvalResult[symbol];
+  const closeType = hitTP                    ? "TP HIT"
+    : lastEval?.timeForced                   ? "TIME LIMIT"
+    : lastEval?.reason?.includes("Trailing") ? "TRAILING SL"
+    : "SL HIT";
 
   logger.trade(`[${coin}] 🔔 ${closeType} (${closeSource}) @ $${actualExitPrice.toFixed(info.decimals)} | PnL: $${estPnl.toFixed(2)}`);
 
@@ -745,7 +834,13 @@ async function handlePositionClosed(symbol, price, info, client, notifier) {
     closeReason: `${closeType} (${closeSource})`, strategy: "AUTO",
   });
 
-  if (estPnl < 0) { dailyLoss += Math.abs(estPnl); dailyStats.losses++; } else dailyStats.wins++;
+  if (estPnl < 0) {
+    dailyLoss += Math.abs(estPnl);
+    dailyStats.losses++;
+  } else {
+    dailyStats.wins++;
+  }
+  updateStreak(dailyStats, estPnl >= 0);
   dailyStats.totalPnl += estPnl;
   dailyStats.trades++;
 
@@ -761,6 +856,7 @@ async function handlePositionClosed(symbol, price, info, client, notifier) {
 
   posMgr.remove(symbol);
   delete activePositions[symbol];
+  delete lastEvalResult[symbol]; // cleanup
 }
 
 // ─── MANAGE POSISI TERBUKA ────────────────────────────────
@@ -777,11 +873,11 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
 
   if (!posMgr.isTracking(symbol)) {
     const atrPct = atr ? (atr / entryPrice) * 100 : 0.5;
-    const slt    = getSlTp(CONFIG.leverage, "normal");
+    const slt    = getSlTpAtr(CONFIG.leverage, "normal", atr, entryPrice);
     // ATR-based SL/TP untuk posisi yang diinisialisasi ulang
-    const slPct  = Math.max(slt.sl,  atrPct * 1.2);
-    const tp1Pct = Math.max(slt.tp1, atrPct * 1.8);
-    const tp2Pct = Math.max(slt.tp2, atrPct * 3.0);
+    const slPct  = slt.sl;
+    const tp1Pct = slt.tp1;
+    const tp2Pct = slt.tp2;
 
     posMgr.init({ symbol, side, entryPrice, slPct, tp1Pct, tp2Pct, size, leverage: CONFIG.leverage, atr });
     try {
@@ -799,6 +895,8 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
   }
 
   const eval_ = posMgr.evaluate(symbol, currentPrice);
+  // FIX BUG 1: Simpan hasil evaluate terbaru supaya handlePositionClosed bisa baca alasannya
+  lastEvalResult[symbol] = eval_;
   const pnlSign = parseFloat(pnlPct) >= 0 ? "+" : "";
   logger.tick(`[${coin}] [${side.toUpperCase()}] $${currentPrice.toFixed(d)} | PnL:$${pnlFromExchange.toFixed(2)}(${pnlSign}${pnlPct}%) | SL:$${eval_.currentSL?.toFixed(d) || "?"} | ${eval_.tp1Hit ? "TP1✅" : "TP1⏳"} | ${eval_.tp2Hit ? "TP2✅" : "TP2⏳"}`);
 
@@ -876,6 +974,7 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
 
     posMgr.remove(symbol);
     delete activePositions[symbol];
+    delete lastEvalResult[symbol]; // cleanup
 
     pnlTracker.record({
       symbol, side,
@@ -889,7 +988,14 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
       strategy  : "TF",
     });
 
-    if (actualPnl < 0) { dailyLoss += Math.abs(actualPnl); dailyStats.losses++; } else dailyStats.wins++;
+    if (actualPnl < 0) {
+      dailyLoss += Math.abs(actualPnl);
+      dailyStats.losses++;
+    } else {
+      dailyStats.wins++;
+    }
+    updateStreak(dailyStats, actualPnl >= 0);
+
     dailyStats.totalPnl += actualPnl;
     dailyStats.trades++;
 
@@ -922,6 +1028,7 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
 
       posMgr.remove(symbol);
       delete activePositions[symbol];
+      delete lastEvalResult[symbol]; // cleanup
 
       pnlTracker.record({
         symbol, side,
@@ -935,7 +1042,13 @@ async function managePosition(pos, symbol, currentPrice, rsi, trend, histogram, 
         strategy  : "TF",
       });
 
-      if (pnlFromExchange < 0) { dailyLoss += Math.abs(pnlFromExchange); dailyStats.losses++; } else dailyStats.wins++;
+      if (pnlFromExchange < 0) {
+        dailyLoss += Math.abs(pnlFromExchange);
+        dailyStats.losses++;
+      } else {
+        dailyStats.wins++;
+      }
+      updateStreak(dailyStats, pnlFromExchange >= 0);
       dailyStats.totalPnl += pnlFromExchange;
       dailyStats.trades++;
 

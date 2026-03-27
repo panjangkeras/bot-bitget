@@ -1,18 +1,12 @@
 /**
- * groqAnalyzer.js — AI Analyzer untuk Scalping Santai  v2.1
- *
+ * groqAnalyzer.js — AI Analyzer untuk Scalping Santai
+ * 
  * Upgrade dari versi lama:
  * - Leverage dikunci 10x–30x (tidak ada 40x/50x)
  * - Prompt lebih pintar: MTF 1m/5m/15m/30m aware
  * - Threshold confidence lebih tinggi → entry lebih selektif
  * - Fallback rule-based lebih robust
- *
- * Improve v2.1:
- * - analyzeTechnical: tambah %B, volTrend, S/R touched-level context
- *   recommended_lev dikunci 10x (sesuai env LEVERAGE=10)
- * - makeDecision: SOLUSDT-specific guidance (SL floor 0.6%, ATR context)
- *   loss prevention lebih ketat, "don't chase" rule
- * - analyzeOpenPosition: tambah ATR%, trailing SL distance, close threshold lebih presisi
+ * - Prompt bahasa lebih jelas untuk llama
  */
 
 const https   = require("https");
@@ -181,19 +175,7 @@ class GroqAnalyzer {
     return this._technicalFallback(rsi, histogram, parseInt(bullPct), parseInt(bearPct));
   }
 
-  // Tambah sweep info ke prompt jika ada
-  const sweepCtx = (sr && (sr.atResistance || sr.atSupport))
-    ? `\nS/R Alert: ${sr.atResistance ? "AT RESISTANCE ("+sr.strongResistance?.toFixed(4)+")" : "AT SUPPORT ("+sr.strongSupport?.toFixed(4)+")"}` : "";
-
-  const volCtx = volume
-    ? `${volume.surge.toFixed(2)}x (${volume.trend}, ${volume.volTrend || ""})`
-    : "N/A";
-
-  const bbCtx = bb
-    ? `${bbPos} width=${bbW}% %B=${bb.pctB?.toFixed(2) || "N/A"} ${squeeze}`
-    : "N/A";
-
-  const prompt = `You are a strict crypto scalping analyst for SOLUSDT futures 10x leverage. PROTECT CAPITAL first, profit second.
+  const prompt = `You are a strict crypto scalping analyst. Your job is to PROTECT CAPITAL first, profit second.
 
 === CONFLUENCE ANALYSIS (pre-calculated) ===
 Direction : ${conf.direction} | Score: ${conf.score > 0 ? "+" : ""}${conf.score}/10
@@ -204,32 +186,37 @@ WARNINGS   : ${conf.warnings.join(", ") || "none"}
 === MARKET CONTEXT ===
 Price   : $${price}
 ATR(14) : ${atr ? atr.toFixed(5) : "N/A"} = ${atr ? ((atr/price)*100).toFixed(3)+"%" : "N/A"} of price
-Pattern : ${pattern || "NONE"}${sweepCtx}
+Pattern : ${pattern || "NONE"}
 
 === MULTI-TIMEFRAME ===
 ${tfSummary}
 BULL weight: ${bullPct}% | BEAR weight: ${bearPct}%
-Rule: 15m/30m must NOT be strongly opposite to entry direction.
+Rule: 15m/30m must NOT conflict with entry direction.
 
-=== KEY INDICATORS ===
+=== RAW INDICATORS ===
 RSI: ${rsi.toFixed(2)} | StochRSI K=${stochRSI?.k.toFixed(1) || "N/A"} D=${stochRSI?.d.toFixed(1) || "N/A"}
-MACD Histogram: ${histogram.toFixed(6)} (${histogram > 0 ? "positive=bullish" : "negative=bearish"})
-BB: ${bbCtx}
-Volume: ${volCtx}
-Momentum(ATR-norm): ${momentum !== undefined ? momentum : "N/A"} (positive=bullish, negative=bearish)
-${sr ? `S/R zone: ${sr.zone} | Nearest level: ${sr.nearestLevelPct}% away` : ""}
+MACD Hist: ${histogram.toFixed(6)} | BB: ${bbPos} width=${bbW}% ${squeeze}
+Volume: ${volume ? volume.surge.toFixed(2)+"x ("+volume.trend+")" : "N/A"}
+${sr ? `S/R: R1=$${sr.r1?.toFixed(4)} Pivot=$${sr.pivot?.toFixed(4)} S1=$${sr.s1?.toFixed(4)}` : ""}
 
 === STRICT ENTRY RULES ===
-LONG only if ALL: score >= +2, RSI < 70, StochRSI K not > 80, BB not above upper, 15m/30m not STRONG_DOWNTREND
-SHORT only if ALL: score <= -2, RSI > 30, StochRSI K not < 20, BB not below lower, 15m/30m not STRONG_UPTREND
-HOLD always if: BB squeeze (width < 0.4%), score -1 to +1, any CRITICAL warning
+Only recommend LONG/SHORT if:
+- Confluence score >= +2 for LONG, <= -2 for SHORT
+- At least 3 bull/bear signals confirmed
+- NO BB squeeze warning
+- 15m AND 30m trend must NOT be strongly opposite
+- RSI not extreme (< 70 for LONG, > 30 for SHORT)
 
-Leverage guide (max 10x per env — do NOT exceed):
-10x: any valid signal with score >= +2/-2 (this is the cap for this bot)
-HOLD: score between -1 and +1, OR BB squeeze, OR RSI extreme
+Leverage guide (conservative — protect capital):
+30x: score >= +5/-5 AND 15m+30m both aligned AND RSI 44-60
+25x: score >= +4/-4 AND 15m aligned AND RSI 42-62
+20x: score >= +3/-3 AND 5m+15m aligned
+15x: score >= +2/-2 AND 5m aligned
+10x: only if mixed but slight lean — enter very cautiously
+HOLD: score between -1 and +1 OR any critical warning
 
-Respond ONLY with exact JSON (no markdown, no explanation):
-{"signal":"STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL","direction":"LONG|SHORT|NONE","confidence":0.65,"reason":"max 80 chars","risk":"LOW|MEDIUM|HIGH","entry_quality":"EXCELLENT|GOOD|FAIR|POOR","tf_alignment":"${bullPct}%bull/${bearPct}%bear","recommended_lev":10}`;
+Respond ONLY with exact JSON (no markdown):
+{"signal":"STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL","direction":"LONG|SHORT|NONE","confidence":0.65,"reason":"max 80 chars","risk":"LOW|MEDIUM|HIGH","entry_quality":"EXCELLENT|GOOD|FAIR|POOR","tf_alignment":"${bullPct}%bull/${bearPct}%bear","recommended_lev":15}`;
 
   try {
     const r   = await this._chat(prompt, 280);
@@ -337,46 +324,43 @@ score: float -1.0 to 1.0 (negative=bearish, positive=bullish)`;
   ? `Confluence: ${ta.confluence.direction} score=${ta.confluence.score > 0 ? "+" : ""}${ta.confluence.score} | ${ta.confluence.bullScore}↑ bull / ${ta.confluence.bearScore}↓ bear\nWarnings: ${ta.confluence.warnings.length > 0 ? ta.confluence.warnings.join("; ") : "none"}`
   : "Confluence: N/A";
 
-const prompt = `Make the FINAL entry decision for SOL/USDT futures at $${price}. Bot uses 10x leverage, $20/trade. CAPITAL PROTECTION IS PRIORITY #1.
-${memoryContext ? "\n" + memoryContext + "\nUse memory to adjust confidence: lower if poor history for this side, raise slightly if strong.\n" : ""}
+const prompt = `Make the FINAL entry decision for ${coin} at $${price}. CAPITAL PROTECTION IS PRIORITY #1.
+${memoryContext ? "\n" + memoryContext + "\nUse this memory to adjust confidence: lower it if this symbol/side has poor history, raise slightly if strong.\n" : ""}
 === SIGNAL SUMMARY ===
 Technical : ${ta.signal} | Direction: ${ta.direction}
 Confidence: ${(ta.confidence * 100).toFixed(0)}% | Quality: ${ta.entryQuality}
 TF Align  : ${ta.tfAlignment}
 ${confSummary}
-Momentum  : ${chg}% last 10m (${mom}) | Session: ${sessionInfo}
+Momentum  : ${chg}% (${mom}) | Session: ${sessionInfo}
 
 Sentiment : ${sentiment.label} (impact: ${sentiment.impact}) — ${sentiment.reason}
 Conflict  : ${sentimentConflict ? "YES — news contradicts technicals → HOLD unless score >= +4" : "NO"}
 ${sentiment.warning ? "NEWS WARNING: " + sentiment.warning : ""}
 
-=== STRICT ENTRY CRITERIA (ALL must pass) ===
+=== STRICT ENTRY CRITERIA (ALL must be true) ===
 1. Confidence >= ${confThr}
-2. Quality = EXCELLENT or GOOD only (FAIR/POOR = HOLD, no exception)
+2. Quality = EXCELLENT or GOOD (FAIR/POOR = HOLD)
 3. No HIGH sentiment conflict UNLESS confluence score >= +4/-4
-4. Momentum not strongly opposing direction (opposing > 0.3% in last 10m = red flag)
-5. Risk = LOW or MEDIUM only
-6. Session active (not QUIET/SKIP)
+4. Momentum not strongly opposing (opposing > 0.3% = red flag)
+5. Risk = LOW or MEDIUM
+6. Session is active (not QUIET/DINI_HARI)
 
-=== LOSS PREVENTION — check before ANY BUY/SELL ===
-- Confluence score -1 to +1 → ALWAYS HOLD, no exception
-- BB squeeze warning → HOLD, wait for breakout
-- HIGH sentiment conflict AND score < 4 → HOLD
-- Momentum opposing direction by > 0.5% → HOLD or skip
-- Quality POOR → HOLD regardless of anything
-- SOLUSDT 10x: SL should be ATR-based, not tighter than 0.6% to avoid noise-out
-- Do NOT chase: if price moved >0.3% since signal, consider HOLD instead of NOW
+=== LOSS PREVENTION RULES (check before BUY/SELL) ===
+- If confluence score between -1 and +1: ALWAYS HOLD — setup terlalu mixed
+- If any warning contains "BB squeeze": HOLD — tunggu breakout
+- If sentiment HIGH conflict AND score < 4: HOLD — news terlalu kuat
+- If momentum opposing direction by > 0.5%: HOLD atau tunggu reversal
+- If quality POOR: HOLD tidak peduli signal apapun
 
-=== SL/TP GUIDANCE (10x leverage, ATR-aware) ===
+=== SL/TP GUIDANCE ===
 Default for ${lev}x ${sigTier}: SL=${defSlt.sl}% | TP1=${defSlt.tp1}% | TP2=${defSlt.tp2}%
-For SOLUSDT at 10x:
-- ATR typically 0.05-0.15, so ATR% ≈ 0.06-0.18% per minute
-- SL floor: 0.6% (tight SL on SOL 1m = noise-out risk)
-- SL ceiling: 2.0% (wider = too much drawdown on $20)
-- TP2 minimum: SL × 2.0 (ensure positive expected value)
-- Never: SL < 0.5% or TP2 < 1.2%
+Adjust based on:
+- High ATR/volatility → widen SL by +0.2-0.3%, widen TP proportionally
+- Low volatility (squeeze) → do NOT enter, output HOLD
+- Near S/R: tighten SL if at support (LONG) or resistance (SHORT)
+Never: SL < 0.5% or TP2 < 1.5%
 
-Respond ONLY with this exact JSON (no markdown):
+Respond ONLY with this JSON (no markdown):
 {"action":"BUY|SELL|HOLD","position":"LONG|SHORT|NONE","confidence":0.65,"reason":"max 80 chars","sl_pct":${defSlt.sl},"tp1_pct":${defSlt.tp1},"tp2_pct":${defSlt.tp2},"urgency":"NOW|WAIT|SKIP","grade":"A|B|C|D","risk_warning":"","leverage_used":${lev}}`;
     try {
       const r = await this._chat(prompt, 280);
@@ -420,34 +404,19 @@ Respond ONLY with this exact JSON (no markdown):
 
   // ─── 4. MONITOR POSISI TERBUKA ────────────────────────────
   async analyzeOpenPosition({ side, entryPrice, currentPrice, pnl, pnlPct, rsi, trend, histogram, atr, tp1Hit, trailSL }) {
-    const isLong    = side === "long";
-    const atrPct    = atr ? ((atr / currentPrice) * 100).toFixed(3) : "N/A";
-    const pnlSign   = parseFloat(pnlPct) >= 0 ? "+" : "";
-    const slDist    = trailSL
-      ? Math.abs(currentPrice - trailSL) / currentPrice * 100
-      : null;
+    const prompt = `Evaluate this open ${side.toUpperCase()} scalping position.
 
-    const prompt = `Evaluate this open ${side.toUpperCase()} SOL/USDT futures position (10x leverage).
-
-Position: Entry $${entryPrice} | Now $${currentPrice} | PnL $${typeof pnl === "number" ? pnl.toFixed(2) : pnl} (${pnlSign}${pnlPct}%)
-TP1: ${tp1Hit ? "HIT ✅ — SL moved to breakeven" : "not yet"} | Trail SL: ${trailSL ? "$"+trailSL.toFixed(4)+" ("+slDist?.toFixed(3)+"% away)" : "N/A"}
+Entry: $${entryPrice} | Now: $${currentPrice} | PnL: $${typeof pnl === "number" ? pnl.toFixed(2) : pnl} (${pnlPct}%)
+TP1: ${tp1Hit ? "HIT ✅" : "not yet"} | Trail SL: $${trailSL || "N/A"}
 RSI: ${rsi.toFixed(2)} | Trend: ${trend} | MACD Histogram: ${histogram ? histogram.toFixed(6) : "N/A"}
-ATR%: ${atrPct}% (SOL 1m typical 0.06-0.18%)
 
-CLOSE if ANY of these:
-- LONG  → RSI > 73 AND (DOWNTREND or histogram < 0)
-- SHORT → RSI < 27 AND (UPTREND or histogram > 0)
-- PnL unrealized > +2.5% (lock profit, TP2 might not hit)
-- Trend strongly reversed for last 3 candles
-- RSI extreme (>75 for LONG, <25 for SHORT) regardless of PnL
+CLOSE conditions:
+LONG  → RSI > 73 AND (trend DOWNTREND OR negative histogram) OR PnL > +3%
+SHORT → RSI < 27 AND (trend UPTREND OR positive histogram) OR PnL > +3%
+Any direction → trend strongly reversed for 2+ candles
 
-HOLD if:
-- TP1 already hit and trailing SL active (let it run)
-- PnL between -0.5% and +1% and no extreme RSI
-- Trend still aligned with position
-
-Respond ONLY with JSON:
-{"action":"HOLD|CLOSE","reason":"max 60 chars","urgency":"HIGH|NORMAL"}`;
+Respond ONLY with this JSON:
+{"action":"HOLD|CLOSE","reason":"brief reason max 60 chars","urgency":"HIGH|NORMAL"}`;
 
     try {
       const r = await this._chat(prompt, 100);
